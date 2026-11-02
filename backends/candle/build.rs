@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 
 fn main() {
+    #[cfg(feature = "cuda")]
+    build_geglu().expect("compile CUDA GeGLU kernel");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     if let Ok(compute_cap) = set_compute_cap() {
         println!("cargo:rustc-env=CUDA_COMPUTE_CAP={compute_cap}");
@@ -32,4 +34,27 @@ fn set_compute_cap() -> Result<usize> {
         cap.parse::<usize>().context("cannot parse as int")?
     };
     Ok(compute_cap)
+}
+
+#[cfg(feature = "cuda")]
+fn build_geglu() -> Result<()> {
+    use std::{env, path::PathBuf, process::Command};
+    println!("cargo:rerun-if-changed=src/layers/geglu.cu");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    let cap = set_compute_cap()?;
+    let nvcc = env::var("CUDA_HOME")
+        .map(|home| PathBuf::from(home).join("bin/nvcc"))
+        .unwrap_or_else(|_| PathBuf::from("nvcc"));
+    let output = PathBuf::from(env::var("OUT_DIR")?).join("geglu.ptx");
+    let status = Command::new(nvcc)
+        .args(["-ptx", "-O3", "--use_fast_math", "-std=c++14"])
+        .arg(format!("--gpu-architecture=compute_{cap}"))
+        .arg("src/layers/geglu.cu")
+        .arg("-o")
+        .arg(output)
+        .status()?;
+    if !status.success() {
+        bail!("nvcc failed: {status}");
+    }
+    Ok(())
 }

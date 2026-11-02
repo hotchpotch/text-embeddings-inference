@@ -4556,6 +4556,7 @@ dependencies = [
  "candle-nn",
  "candle-rotary",
  "candle-transformers",
+ "half",
  "hf-hub",
  "insta",
  "intel-mkl-src",
@@ -4618,6 +4619,7 @@ name = "text-embeddings-core"
 version = "1.9.4"
 dependencies = [
  "async-channel",
+ "futures",
  "hf-hub",
  "metrics",
  "serde_json",

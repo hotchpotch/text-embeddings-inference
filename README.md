@@ -1,3 +1,37 @@
+# ModernBERT reranker kernel optimization branch
+
+This branch optimizes **ModernBERT cross-encoder reranking on CUDA FP16**. It carries the tested A5 implementation: fused dual-projection GeGLU kernels, fused residual/normalization, and CLS-only queries and output computation in the final global-attention layer. It keeps every model layer, original weights, input tokens, and candidate documents. CUDA Graphs, FP8, layer removal, and attention approximations are not included.
+
+Reference throughput on an **NVIDIA RTX PRO 6000 Blackwell Max-Q**, CUDA 12.9, using the original Japanese rerankers:
+
+| Model | Production replay | Upstream backend baseline | [PR #897](https://github.com/huggingface/text-embeddings-inference/pull/897) | A5 kernels | Speedup vs baseline / PR |
+| --- | --- | ---: | ---: | ---: | ---: |
+| [xsmall-v2](https://huggingface.co/hotchpotch/japanese-reranker-xsmall-v2) | limit20 | 8,362–8,461 pairs/s | 11,461–11,518 | **13,795–14,146** | **1.65–1.67× / 1.20–1.23×** |
+| xsmall-v2 | limit100 | 8,458–8,497 | 11,449–11,480 | **13,995–14,090** | **1.65–1.66× / 1.22–1.23×** |
+| [base-v2](https://huggingface.co/hotchpotch/japanese-reranker-base-v2) | limit20 | 2,207–2,213 | 3,126–3,130 | **3,935–3,946** | **1.78× / 1.26×** |
+| base-v2 | limit100 | 2,247–2,249 | 3,185–3,191 | **4,048–4,054** | **1.80× / 1.27×** |
+
+These are previously measured A5 results, before packaging the kernels into this standalone branch: xsmall on November 2, 2026; base on October 27, 2026. Baseline and PR controls used the same optional request grouping. Each range contains the forward/reverse medians of three full passes, with concurrency 8, tokenizer workers 8, a 36,864-token batch budget, and 120 seconds of external preheat. The two replay inputs contain 2,061/2,057 requests and 73,050/146,840 pairs; their names are not fixed candidate counts or sequence lengths. They mix 20/50 and 20/120 candidates, respectively. This is a private production replay, not a public relevance benchmark. The upstream base is `069ceab366d7cab14cfd40dbcb0d58c93f892583`.
+
+On that replay, xsmall A5 changed the top-ranked candidate in 1/2,061 and 2/2,057 requests relative to the baseline. Scores need not be bit-identical; rank preservation is not relevance accuracy. Throughput depends on GPU and workload. **NVIDIA L4 has not been benchmarked**; the embedded PTX targets SM89, while the measurements above used SM120.
+
+The standalone branch also passed a full-replay check against the saved A5 implementation for both models, with zero top-1 changes in all three passes per input. See the [packaging validation](docs/modernbert-kernels.md#standalone-branch-validation-november-2-2026) for its separate protocol and results.
+
+The xsmall and base kernels are embedded and selected automatically from model dimensions. No model conversion, external PTX directory, Python/Triton runtime, or CUDA Graph capture is needed. An unseen kernel variant can still incur a first-request load/JIT cost. TEI's normal internal startup warmup remains in place; the benchmark's 120-second preheat is not a serving requirement.
+
+Build from this checkout and enable the same optional rerank request grouping used in the measurements:
+
+```sh
+cargo build --release --locked --features candle-cuda --bin text-embeddings-router
+TEI_RERANK_REQUEST_BATCH=1 ./target/release/text-embeddings-router \
+  --model-id hotchpotch/japanese-reranker-xsmall-v2 \
+  --dtype float16 --tokenization-workers 8 --max-batch-tokens 36864
+```
+
+Use `hotchpotch/japanese-reranker-base-v2` for base with the same executable. CUDA Toolkit and GPU architecture setup follow the upstream build instructions below. Existing published TEI images do not contain this branch. See [kernel implementation, regeneration, and validation](docs/modernbert-kernels.md).
+
+---
+
 <div align="center">
 
 # Text Embeddings Inference

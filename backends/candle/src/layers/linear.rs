@@ -48,6 +48,10 @@ impl Linear {
         }
     }
 
+    pub(crate) fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 

@@ -7,6 +7,7 @@ homepage.workspace = true
 
 [dependencies]
 async-channel = "^2.3"
+futures = "^0.3"
 hf-hub = { workspace = true }
 metrics = { workspace = true }
 serde_json = { workspace = true }

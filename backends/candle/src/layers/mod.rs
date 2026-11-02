@@ -15,3 +15,13 @@ pub use linear::{HiddenAct, Linear};
 #[allow(unused_imports)]
 pub use rms_norm::RMSNorm;
 pub use rotary::{apply_rotary, get_cos_sin, get_inv_freqs, RopeParameters, RopeScaling};
+
+#[cfg(feature = "cuda")]
+mod geglu;
+#[cfg(feature = "cuda")]
+pub use geglu::fused_geglu;
+
+#[cfg(feature = "cuda")]
+mod dual_geglu;
+#[cfg(feature = "cuda")]
+pub use dual_geglu::DualGeGlu;

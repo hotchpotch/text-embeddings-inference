@@ -71,6 +71,7 @@ impl ModernBertAttention {
         cos: &Tensor,
         sin: &Tensor,
         max_s: usize,
+        cls_queries: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
 
@@ -89,6 +90,16 @@ impl ModernBertAttention {
 
         apply_rotary_inplace(&q, &k, &cos, &sin, true)?;
 
+        // In the final global-attention layer, CLS pooling needs only one query per sequence.
+        let q = if let Some((indices, _)) = cls_queries {
+            index_select(&qkv, indices, 0)?.narrow(1, 0, self.num_attention_heads)?
+        } else {
+            q
+        };
+        let (cu_seqlens_q, max_s_q) = cls_queries
+            .map(|(_, lengths)| (lengths, 1))
+            .unwrap_or((cu_seqlens, max_s));
+
         let window_size = if self.use_local_attention {
             Some(self.local_attention)
         } else {
@@ -100,9 +111,9 @@ impl ModernBertAttention {
             &k,
             &v,
             None,
+            cu_seqlens_q,
             cu_seqlens,
-            cu_seqlens,
-            max_s,
+            max_s_q,
             max_s,
             self.softmax_scale,
             false,
@@ -161,30 +172,41 @@ impl ModernBertEncoderLayer {
     fn forward(
         &self,
         hidden_states: &Tensor,
+        residual: Option<&Tensor>,
         cu_seqlens: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         max_s: usize,
-    ) -> Result<Tensor> {
+        cls_queries: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
         let _enter = self.span.enter();
 
-        let residual = hidden_states.clone();
-
-        let attn_norm = if let Some(attn_norm) = &self.attn_norm {
-            attn_norm.forward(hidden_states, None)?
+        let (attn_norm, residual) = if let Some(attn_norm) = &self.attn_norm {
+            if let Some(residual) = residual {
+                attn_norm.forward_with_residual(hidden_states, residual)?
+            } else {
+                (
+                    attn_norm.forward(hidden_states, None)?,
+                    hidden_states.clone(),
+                )
+            }
         } else {
-            hidden_states.clone()
+            (hidden_states.clone(), hidden_states.clone())
         };
 
-        let attn_outputs = self.attn.forward(&attn_norm, cu_seqlens, cos, sin, max_s)?;
+        let residual = if let Some((indices, _)) = cls_queries {
+            index_select(&residual, indices, 0)?
+        } else {
+            residual
+        };
+        let attn_outputs =
+            self.attn
+                .forward(&attn_norm, cu_seqlens, cos, sin, max_s, cls_queries)?;
 
-        let hidden_states = residual.add(&attn_outputs)?;
-
-        let mlp_output = self
-            .mlp
-            .forward(&self.mlp_norm.forward(&hidden_states, None)?)?;
-
-        hidden_states.add(&mlp_output)
+        let (normalized, residual) = self
+            .mlp_norm
+            .forward_with_residual(&attn_outputs, &residual)?;
+        Ok((self.mlp.forward(&normalized)?, residual))
     }
 }
 
@@ -217,19 +239,39 @@ impl ModernBertEncoder {
         cu_seqlens: &Tensor,
         rotary_cache: &HashMap<bool, (Tensor, Tensor)>,
         max_s: usize,
-    ) -> Result<Tensor> {
+        cls_queries: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
         let _enter = self.span.enter();
 
         let mut hidden_states = hidden_states.clone();
+        let mut residual = None;
 
         for (index, layer) in self.layers.iter().enumerate() {
             let use_local_attention = index % self.global_attn_every_n_layers != 0;
             let (cos, sin) = &rotary_cache[&use_local_attention];
 
-            hidden_states = layer.forward(&hidden_states, cu_seqlens, cos, sin, max_s)?;
+            let queries = if index + 1 == self.layers.len() {
+                cls_queries
+            } else {
+                None
+            };
+            let (output, updated_residual) = layer.forward(
+                &hidden_states,
+                residual.as_ref(),
+                cu_seqlens,
+                cos,
+                sin,
+                max_s,
+                queries,
+            )?;
+            hidden_states = output;
+            residual = Some(updated_residual);
         }
 
-        Ok(hidden_states)
+        Ok((
+            hidden_states,
+            residual.expect("ModernBERT must have at least one layer"),
+        ))
     }
 }
 
@@ -350,10 +392,32 @@ impl FlashModernBertModel {
         }
 
         let hidden_states = self.embeddings.forward(&input_ids)?;
-        let hidden_states =
-            self.encoder
-                .forward(&hidden_states, &cu_seqlens, &rotary_cache, max_length)?;
-        let outputs = self.final_norm.forward(&hidden_states, None)?;
+        let prune_cls = self.pool == Pool::Cls
+            && batch.raw_indices.is_empty()
+            && batch.pooled_indices.len() == batch_size
+            && (self.encoder.layers.len() - 1) % self.encoder.global_attn_every_n_layers == 0;
+        let cls_queries = if prune_cls {
+            Some((
+                cu_seqlens.narrow(0, 0, batch_size)?,
+                Tensor::arange(0u32, batch_size as u32 + 1, &self.device)?,
+            ))
+        } else {
+            None
+        };
+        let (hidden_states, residual) = self.encoder.forward(
+            &hidden_states,
+            &cu_seqlens,
+            &rotary_cache,
+            max_length,
+            cls_queries
+                .as_ref()
+                .map(|(indices, lengths)| (indices, lengths)),
+        )?;
+        let outputs = self.final_norm.forward(&hidden_states, Some(&residual))?;
+
+        if prune_cls {
+            return Ok((Some(outputs), None));
+        }
 
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
@@ -472,5 +536,45 @@ impl Model for FlashModernBertModel {
                 classifier.forward(&pooled_embeddings)
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "flash-attn"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_cls_queries_match_full_attention_for_unequal_lengths() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        device.set_seed(42)?;
+        let weight =
+            |rows, cols| Tensor::randn(0f32, 0.05, (rows, cols), &device)?.to_dtype(DType::F16);
+        let attention = ModernBertAttention {
+            wqkv: Linear::new(weight(192, 64)?, None, None),
+            wo: Linear::new(weight(64, 64)?, None, None),
+            num_attention_heads: 2,
+            attention_head_size: 32,
+            softmax_scale: 1. / 32f32.sqrt(),
+            local_attention: 64,
+            use_local_attention: false,
+            span: tracing::Span::none(),
+        };
+        let input = Tensor::randn(0f32, 1., (11, 64), &device)?.to_dtype(DType::F16)?;
+        let lengths = Tensor::new(&[0u32, 3, 11], &device)?;
+        let indices = Tensor::new(&[0u32, 3], &device)?;
+        let queries = Tensor::new(&[0u32, 1, 2], &device)?;
+        let cos = Tensor::ones((11, 16), DType::F16, &device)?;
+        let sin = Tensor::zeros((11, 16), DType::F16, &device)?;
+        let full = attention.forward(&input, &lengths, &cos, &sin, 8, None)?;
+        let expected = index_select(&full, &indices, 0)?;
+        let actual =
+            attention.forward(&input, &lengths, &cos, &sin, 8, Some((&indices, &queries)))?;
+        assert_eq!(actual.dims(), &[2, 64]);
+        let diff = (expected.to_dtype(DType::F32)? - actual.to_dtype(DType::F32)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff < 0.002, "CLS attention max difference: {diff}");
+        Ok(())
     }
 }

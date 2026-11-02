@@ -1,0 +1,18 @@
+{
+  "target_arch": 89,
+  "triton_version": "3.5.1",
+  "sha256": {
+    "modernbert/base/large.json": "2bffab8565335b3ec98f616165aed1d7a63b07abff3be1543d213a98d696a726",
+    "modernbert/base/large.ptx": "31c154ae4aef8d03c449dad3da8e51b84fdd604baeddd7e8a9d8cdf8d46cdee1",
+    "modernbert/base/medium.json": "7963d9283951125743d48e31204bd0a31a2be2530181d719e538d5769eb74125",
+    "modernbert/base/medium.ptx": "8dabc884dbc34f14cc991ef1841f52aada1468517102e2cdfd0cca4c18731567",
+    "modernbert/base/small.json": "c6b7f72d3f17d3da12cb68620c747ede2faea5d5079b82baadd4029e4e033786",
+    "modernbert/base/small.ptx": "7817662e6ccabf27b12731ae4c6a8a08ba12b5a44263dfc7a89261004ac1e012",
+    "modernbert/xsmall/large.json": "7cb290e5527f31b8dfe3e87caaa29cf4c1f3433f2c194ca77c74868d5920eabe",
+    "modernbert/xsmall/large.ptx": "d7e141a956c05ce729b963d2cfbc3cf0107a5f74e6c3a45dad7185c03ebef012",
+    "modernbert/xsmall/medium.json": "b128a6f0e7a47ee44dc03cf0bf1dd5eda236881b520fad12ea16889a8656c1ae",
+    "modernbert/xsmall/medium.ptx": "c03a083afdb68821e683413d82e26fb4dc5b00a33c285d995da1947046f5538f",
+    "modernbert/xsmall/small.json": "bc59252d75891aa6b2d12582a5fd91825eee45151ce52b5fa70c7dfed10a5baf",
+    "modernbert/xsmall/small.ptx": "de7385a0a95d45fed18683879bab2fddec48c3d367a9ed017b2be2ee899426e4"
+  }
+}

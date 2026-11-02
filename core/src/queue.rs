@@ -74,6 +74,14 @@ impl Queue {
             .expect("Queue background task dropped the receiver or the receiver is too behind. This is a bug.");
     }
 
+    /// Append one request's prepared entries without an interleaved NextBatch.
+    #[instrument(skip_all)]
+    pub fn append_batch(&self, entries: Vec<Entry>) {
+        self.queue_sender
+            .try_send(QueueCommand::AppendBatch(entries, Span::current()))
+            .expect("Queue background task dropped the receiver or the receiver is too behind. This is a bug.");
+    }
+
     /// Get the next batch from the queue
     #[instrument(skip(self))]
     pub async fn next_batch(&self) -> Option<NextBatch> {
@@ -114,6 +122,12 @@ fn queue_blocking_task(
                 entries.push_back(*entry);
                 let gauge = metrics::gauge!("te_queue_size");
                 gauge.increment(1.0);
+            }
+            QueueCommand::AppendBatch(batch, span) => {
+                let _span = span.entered();
+                let count = batch.len();
+                entries.extend(batch);
+                metrics::gauge!("te_queue_size").increment(count as f64);
             }
             QueueCommand::NextBatch {
                 response_sender,
@@ -201,6 +215,12 @@ fn queue_blocking_task(
 
                 let _ = response_sender.send(next_batch);
 
+                if batch_size > 0 {
+                    metrics::histogram!("te_batch_nonempty_size").record(batch_size as f64);
+                    metrics::histogram!("te_batch_nonempty_tokens").record(current_tokens as f64);
+                } else {
+                    metrics::counter!("te_batch_empty_next_count").increment(1);
+                }
                 let histogram = metrics::histogram!("te_batch_next_size");
                 histogram.record(batch_size as f64);
                 let histogram = metrics::histogram!("te_batch_next_tokens");
@@ -217,8 +237,153 @@ pub type NextBatch = (Vec<Metadata>, Batch);
 #[derive(Debug)]
 enum QueueCommand {
     Append(Box<Entry>, Span),
+    AppendBatch(Vec<Entry>, Span),
     NextBatch {
         response_sender: oneshot::Sender<Option<NextBatch>>,
         span: Span,
     },
+}
+
+#[cfg(test)]
+mod request_batch_tests {
+    use super::*;
+
+    fn entry(token: u32) -> (Entry, oneshot::Receiver<Result<InferResult, BackendError>>) {
+        let (response_tx, response_rx) = oneshot::channel();
+        (
+            Entry {
+                encoding: ValidEncoding {
+                    input_ids: vec![token; 3],
+                    token_type_ids: vec![0; 3],
+                    position_ids: vec![0, 1, 2],
+                },
+                metadata: Metadata {
+                    response_tx,
+                    tokenization: Duration::ZERO,
+                    queue_time: Instant::now(),
+                    prompt_tokens: 3,
+                    pooling: true,
+                },
+            },
+            response_rx,
+        )
+    }
+
+    fn check(
+        max_tokens: usize,
+        max_requests: Option<usize>,
+        cancelled: bool,
+        expected: Vec<Vec<u32>>,
+    ) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let queue = Queue::new(false, max_tokens, max_requests, 16);
+                let (a, a_rx) = entry(11);
+                let (b, b_rx) = entry(22);
+                let (c, c_rx) = entry(33);
+                let mut live = vec![a_rx, c_rx];
+                if cancelled {
+                    drop(b_rx);
+                } else {
+                    live.push(b_rx);
+                }
+                // This single command must be processed before any NextBatch.
+                queue.append_batch(vec![a, b, c]);
+                let (d, d_rx) = entry(44);
+                live.push(d_rx);
+                queue.append(d);
+                for tokens in expected {
+                    let batch = queue.next_batch().await.unwrap();
+                    assert_eq!(
+                        batch.1.input_ids,
+                        tokens.iter().flat_map(|t| [*t; 3]).collect::<Vec<_>>()
+                    );
+                    assert_eq!(batch.0.len(), tokens.len());
+                    assert_eq!(
+                        batch.1.cumulative_seq_lengths,
+                        (0..=tokens.len())
+                            .map(|i| (i * 3) as u32)
+                            .collect::<Vec<_>>()
+                    );
+                    assert!(batch.1.input_ids.len() <= max_tokens);
+                }
+                assert!(queue.next_batch().await.is_none());
+                drop(live);
+            });
+    }
+
+    #[test]
+    fn atomic_append_preserves_request_and_following_entry_order() {
+        check(16, None, false, vec![vec![11, 22, 33, 44]]);
+    }
+    #[test]
+    fn atomic_append_respects_token_budget() {
+        check(6, None, false, vec![vec![11, 22], vec![33, 44]]);
+    }
+    #[test]
+    fn atomic_append_respects_request_limit() {
+        check(16, Some(2), false, vec![vec![11, 22], vec![33, 44]]);
+    }
+    #[test]
+    fn atomic_append_filters_cancelled_entries() {
+        check(16, None, true, vec![vec![11, 33, 44]]);
+    }
+
+    #[test]
+    fn full_120_candidate_request_fits_exact_token_budget() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let lengths: Vec<usize> =
+                    (0..120).map(|i| if i < 30 { 585 } else { 128 }).collect();
+                let total: usize = lengths.iter().sum();
+                for budget in [total, total - 1] {
+                    let queue = Queue::new(false, budget, Some(120), 256);
+                    let mut entries = Vec::new();
+                    let mut receivers = Vec::new();
+                    for (i, &length) in lengths.iter().enumerate() {
+                        let (mut value, receiver) = entry(i as u32);
+                        value.encoding.input_ids = vec![i as u32; length];
+                        value.encoding.token_type_ids = vec![0; length];
+                        value.encoding.position_ids = (0..length as u32).collect();
+                        value.metadata.prompt_tokens = length;
+                        entries.push(value);
+                        receivers.push(receiver);
+                    }
+                    queue.append_batch(entries);
+                    let expected_first = if budget == total { 120 } else { 119 };
+                    let (metadata, batch) = queue.next_batch().await.unwrap();
+                    assert_eq!(metadata.len(), expected_first);
+                    assert_eq!(batch.max_length, 585);
+                    let mut expected_offset = 0;
+                    for (i, &length) in lengths.iter().take(expected_first).enumerate() {
+                        assert_eq!(batch.cumulative_seq_lengths[i] as usize, expected_offset);
+                        assert_eq!(metadata[i].prompt_tokens, length);
+                        assert_eq!(
+                            &batch.input_ids[expected_offset..expected_offset + length],
+                            vec![i as u32; length]
+                        );
+                        expected_offset += length;
+                    }
+                    assert_eq!(batch.input_ids.len(), expected_offset);
+                    assert_eq!(
+                        batch.cumulative_seq_lengths[expected_first] as usize,
+                        expected_offset
+                    );
+                    if budget < total {
+                        let (rest, tail) = queue.next_batch().await.unwrap();
+                        assert_eq!(rest.len(), 1);
+                        assert_eq!(tail.input_ids, vec![119; 128]);
+                        assert_eq!(tail.cumulative_seq_lengths, vec![0, 128]);
+                    }
+                    assert!(queue.next_batch().await.is_none());
+                    drop(receivers);
+                }
+            });
+    }
 }

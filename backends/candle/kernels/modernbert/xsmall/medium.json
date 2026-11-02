@@ -1,0 +1,12 @@
+{
+  "abi": 1,
+  "name": "dual_gemm",
+  "block_m": 32,
+  "block_n": 64,
+  "num_warps": 8,
+  "shared": 40960,
+  "arch": 89,
+  "triton_version": "3.5.1",
+  "hidden": 256,
+  "intermediate": 1024
+}

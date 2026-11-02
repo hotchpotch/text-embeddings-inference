@@ -391,24 +391,60 @@ async fn rerank(
             Err(err)?;
         }
 
-        let mut futures = Vec::with_capacity(batch_size);
         let query_chars = req.query.chars().count();
-        let mut compute_chars = query_chars * batch_size;
-
-        for text in &req.texts {
-            compute_chars += text.chars().count();
-            let local_infer = infer.clone();
-            futures.push(rerank_inner(
-                req.query.clone(),
-                text.clone(),
-                truncate,
-                local_infer.0,
-            ))
-        }
-        let results = join_all(futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<(usize, Duration, Duration, Duration, f32)>, ErrorResponse>>()?;
+        let compute_chars = query_chars * batch_size
+            + req
+                .texts
+                .iter()
+                .map(|text| text.chars().count())
+                .sum::<usize>();
+        let results = if std::env::var("TEI_RERANK_REQUEST_BATCH").as_deref() == Ok("1") {
+            let permits = (0..batch_size)
+                .map(|_| infer.try_acquire_permit().map_err(ErrorResponse::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let inputs = req
+                .texts
+                .iter()
+                .map(|text| (req.query.clone(), text.clone()))
+                .collect();
+            infer
+                .predict_batch(
+                    inputs,
+                    truncate,
+                    req.truncation_direction.into(),
+                    req.raw_scores,
+                    permits,
+                )
+                .await
+                .map_err(ErrorResponse::from)?
+                .into_iter()
+                .map(|response| {
+                    (
+                        response.metadata.prompt_tokens,
+                        response.metadata.tokenization,
+                        response.metadata.queue,
+                        response.metadata.inference,
+                        response.results[0],
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut futures = Vec::with_capacity(batch_size);
+            for text in &req.texts {
+                let local_infer = infer.clone();
+                futures.push(rerank_inner(
+                    req.query.clone(),
+                    text.clone(),
+                    truncate,
+                    local_infer.0,
+                ))
+            }
+            join_all(futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<(usize, Duration, Duration, Duration, f32)>, ErrorResponse>>(
+                )?
+        };
 
         let mut ranks = Vec::with_capacity(batch_size);
         let mut total_tokenization_time = 0;

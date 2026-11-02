@@ -9,6 +9,28 @@ pub struct LayerNormNoBias {
 }
 
 impl LayerNormNoBias {
+    #[cfg(feature = "cuda")]
+    pub fn forward_with_residual(
+        &self,
+        hidden_states: &Tensor,
+        residual: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        if matches!(hidden_states.device(), Device::Cuda(_)) {
+            let shape = hidden_states.shape();
+            let (normalized, residual) = candle_layer_norm::fused_add_layer_norm(
+                &hidden_states.flatten_to(D::Minus2)?,
+                &residual.flatten_to(D::Minus2)?,
+                &self.weight,
+                None,
+                self.epsilon,
+            )?;
+            Ok((normalized.reshape(shape)?, residual.reshape(shape)?))
+        } else {
+            let residual = hidden_states.add(residual)?;
+            Ok((self.forward(&residual, None)?, residual))
+        }
+    }
+
     pub fn load(vb: VarBuilder, hidden_size: usize, epsilon: f32) -> Result<Self> {
         Ok(Self {
             weight: vb
@@ -158,5 +180,38 @@ impl LayerNorm {
                 candle::bail!("`cuda` feature is not enabled")
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fused_layer_norm_preserves_residual_shape_and_values() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        device.set_seed(123)?;
+        let layer = LayerNormNoBias {
+            weight: Tensor::ones(512, DType::F16, &device)?,
+            epsilon: 1e-5,
+            span: tracing::Span::none(),
+        };
+        let input = Tensor::randn(0f32, 1., (2, 3, 512), &device)?.to_dtype(DType::F16)?;
+        let residual = Tensor::randn(0f32, 1., (2, 3, 512), &device)?.to_dtype(DType::F16)?;
+        let sum = input.add(&residual)?;
+        let expected = layer.forward(&sum, None)?;
+        let (actual, carried) = layer.forward_with_residual(&input, &residual)?;
+        assert_eq!(actual.dims(), input.dims());
+        assert_eq!(carried.dims(), input.dims());
+        let max_diff = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()
+        };
+        assert_eq!(max_diff(&carried, &sum)?, 0.);
+        // Fused normalization uses the FP32 sum before it is rounded to FP16.
+        assert!(max_diff(&actual, &expected)? < 0.005);
+        Ok(())
     }
 }

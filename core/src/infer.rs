@@ -1,5 +1,5 @@
 use crate::queue::{Entry, Metadata, NextBatch, Queue};
-use crate::tokenization::{EncodingInput, RawEncoding, Tokenization};
+use crate::tokenization::{EncodingInput, RawEncoding, Tokenization, ValidEncoding};
 use crate::TextEmbeddingsError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -439,6 +439,16 @@ impl Infer {
 
         self.notify_batching_task.notify_one();
 
+        Self::receive_prediction(response_rx, raw_scores, start_time, _permit).await
+    }
+
+    // Both the scalar and request-batch paths share postprocessing and metrics.
+    async fn receive_prediction(
+        response_rx: oneshot::Receiver<Result<InferResult, BackendError>>,
+        raw_scores: bool,
+        start_time: Instant,
+        _permit: OwnedSemaphorePermit,
+    ) -> Result<ClassificationInferResponse, TextEmbeddingsError> {
         let response = response_rx
             .await
             .expect(
@@ -495,6 +505,81 @@ impl Infer {
         histogram.record(response.metadata.inference.as_secs_f64());
 
         Ok(response)
+    }
+
+    /// Prepare a client batch before notifying the batcher. No artificial delay.
+    /// Token budgets and cross-request scheduling remain the queue's responsibility.
+    #[instrument(skip_all)]
+    pub async fn predict_batch(
+        &self,
+        inputs: Vec<(String, String)>,
+        truncate: bool,
+        truncation_direction: TruncationDirection,
+        raw_scores: bool,
+        permits: Vec<OwnedSemaphorePermit>,
+    ) -> Result<Vec<ClassificationInferResponse>, TextEmbeddingsError> {
+        assert_eq!(inputs.len(), permits.len());
+        if !self.is_classifier() {
+            metrics::counter!("te_request_failure", "err" => "model_type").increment(1);
+            return Err(TextEmbeddingsError::Backend(BackendError::Inference(
+                "Model is not a classifier model".to_string(),
+            )));
+        }
+        // Finish tokenization for the request before atomically appending it.
+        // An invalid item fails the request before any of its entries are queued.
+        let prepared = futures::future::join_all(inputs.into_iter().map(|input| async move {
+            let start_time = Instant::now();
+            metrics::counter!("te_predict_count").increment(1);
+            let encoding = self
+                .tokenization
+                .encode(input.into(), truncate, truncation_direction, None)
+                .await
+                .map_err(|err| {
+                    metrics::counter!("te_request_failure", "err" => "tokenization").increment(1);
+                    tracing::error!("{err}");
+                    err
+                })?;
+            let tokenization = start_time.elapsed();
+            Ok::<(ValidEncoding, Instant, Duration), TextEmbeddingsError>((
+                encoding,
+                start_time,
+                tokenization,
+            ))
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let mut entries = Vec::with_capacity(prepared.len());
+        let mut pending = Vec::with_capacity(prepared.len());
+        for ((encoding, start_time, tokenization), permit) in prepared.into_iter().zip(permits) {
+            let (response_tx, response_rx) = oneshot::channel();
+            let preparation = start_time.elapsed();
+            metrics::histogram!("te_predict_batch_preparation_wait_duration")
+                .record(preparation.saturating_sub(tokenization).as_secs_f64());
+            entries.push(Entry {
+                metadata: Metadata {
+                    response_tx,
+                    // Include coordination in preparation; expose its wait separately.
+                    tokenization: preparation,
+                    queue_time: Instant::now(),
+                    prompt_tokens: encoding.input_ids.len(),
+                    pooling: true,
+                },
+                encoding,
+            });
+            pending.push(Self::receive_prediction(
+                response_rx,
+                raw_scores,
+                start_time,
+                permit,
+            ));
+        }
+        self.queue.append_batch(entries);
+        self.notify_batching_task.notify_one();
+        futures::future::join_all(pending)
+            .await
+            .into_iter()
+            .collect()
     }
 
     #[instrument(skip(self))]
